@@ -1,3 +1,6 @@
+#![recursion_limit = "256"]
+use brainfuck::GetOutput;
+use indexed::Debug;
 use numbers::NextNumber;
 
 macro_rules! actions {
@@ -74,6 +77,12 @@ macro_rules! bf {
     ($ram:ty; << $($rest:tt)*) => {
         bf!($ram; < < $($rest)*)
     };
+    ($ram:ty; <- $($rest:tt)*) => {
+        bf!($ram; < - $($rest)*)
+    };
+    ($ram:ty; -> $($rest:tt)*) => {
+        bf!($ram; - > $($rest)*)
+    }
 }
 
 trait TypeNamed {
@@ -124,12 +133,12 @@ impl<T: TypeNamed> TypeNamed for instructions::Incr<T> {
         format!("Incr<{}>", T::name())
     }
 }
-impl<T: TypeNamed> TypeNamed for instructions::MoveRight<T>{
+impl<T: TypeNamed> TypeNamed for instructions::MoveRight<T> {
     fn name() -> String {
         format!("MoveR<{}>", T::name())
     }
 }
-impl<T: TypeNamed> TypeNamed for instructions::MoveLeft<T>{
+impl<T: TypeNamed> TypeNamed for instructions::MoveLeft<T> {
     fn name() -> String {
         format!("MoveL<{}>", T::name())
     }
@@ -144,7 +153,7 @@ impl<T: TypeNamed> TypeNamed for instructions::LoopStart<T> {
         format!("LoopStart<{}>", T::name())
     }
 }
-impl<A: TypeNamed, B: TypeNamed> TypeNamed for brainfuck::Interpreter<A,B>{
+impl<A: TypeNamed, B: TypeNamed> TypeNamed for brainfuck::InterpreterBase<A, B> {
     fn name() -> String {
         format!("Interpreter<{}, {}>", A::name(), B::name())
     }
@@ -199,6 +208,7 @@ mod numbers {
     }
     impl<N: Number> Number for NextNumber<N> {
         fn eval() -> usize {
+            // whilst our numbers can overflow a usize, rustc should reach the recursion limit/crash/oom before this happens
             1 + N::eval()
         }
     }
@@ -307,9 +317,17 @@ mod linked_list {
     {
         type List = Node<Val, <Next as Push<ToAdd>>::List>;
     }
-
+    #[derive(Debug)]
+    pub struct InvalidCharError;
     pub trait ToVec {
         fn to_vec() -> Vec<usize>;
+        fn to_string() -> Result<String, InvalidCharError> {
+            let data = Self::to_vec()
+                .into_iter()
+                .map(|x| u8::try_from(x).map_err(|_| InvalidCharError))
+                .collect::<Result<Vec<_>, _>>()?;
+            String::from_utf8(data).map_err(|_| InvalidCharError)
+        }
     }
     impl ToVec for End {
         fn to_vec() -> Vec<usize> {
@@ -359,6 +377,7 @@ mod linked_list {
 }
 
 mod indexed {
+    use crate::linked_list::InvalidCharError;
     use crate::numbers::Number;
     use crate::{brainfuck, linked_list, numbers};
     use crate::{linked_list::End, numbers::Zero};
@@ -375,7 +394,7 @@ mod indexed {
     {
         type Val = <FirstNode as linked_list::Index<Idx>>::Val;
     }
-    impl<Ram: Get, Output> Get for brainfuck::Interpreter<Ram, Output>{
+    impl<Ram: Get, Output> Get for brainfuck::InterpreterBase<Ram, Output> {
         type Val = <Ram as Get>::Val;
     }
 
@@ -422,6 +441,7 @@ mod indexed {
     pub trait Debug {
         fn index() -> usize;
         fn data() -> Vec<usize>;
+        fn string() -> Result<String, InvalidCharError>;
     }
     impl<FirstNode, Idx> Debug for Indexed<Idx, FirstNode>
     where
@@ -434,12 +454,18 @@ mod indexed {
         fn data() -> Vec<usize> {
             FirstNode::to_vec()
         }
+        fn string() -> Result<String, InvalidCharError> {
+            FirstNode::to_string()
+        }
     }
 }
 
 mod instructions {
     use crate::{
-        brainfuck, indexed::{self, Get}, numbers::{NextNumber, Zero}, operators
+        brainfuck,
+        indexed::{self, Get},
+        numbers::{NextNumber, Zero},
+        operators,
     };
 
     pub trait Instruction {
@@ -447,18 +473,21 @@ mod instructions {
         type Exec;
         /// create a new instruction from data T
         type Create<E>;
+        type Interpreter;
     }
     /*impl<Idx, Val> Instruction for indexed::Indexed<Idx, Val> {
         type Exec = Self;
         type Create<E> = E;
     }*/
-    impl<Ram, Output> Instruction for brainfuck::Interpreter<Ram, Output>{
+    impl<Ram, Output> Instruction for brainfuck::InterpreterBase<Ram, Output> {
         type Exec = Self;
         type Create<E> = E;
+        type Interpreter = Self;
     }
-    impl<Index, Val> Instruction for indexed::Indexed<Index, Val>{
+    impl<Index, Val> Instruction for indexed::Indexed<Index, Val> {
         type Create<E> = E;
         type Exec = Self;
+        type Interpreter = Self;
     }
 
     pub struct Decr<T>(T);
@@ -468,6 +497,7 @@ mod instructions {
     {
         type Exec = <<T as Instruction>::Exec as indexed::VecOp<operators::Sub>>::Indexed;
         type Create<E> = Decr<<T as Instruction>::Create<E>>;
+        type Interpreter = <T as Instruction>::Interpreter;
     }
     pub struct Incr<T>(T);
     impl<T: Instruction> Instruction for Incr<T>
@@ -476,6 +506,7 @@ mod instructions {
     {
         type Exec = <<T as Instruction>::Exec as indexed::VecOp<operators::Add>>::Indexed;
         type Create<E> = Incr<<T as Instruction>::Create<E>>;
+        type Interpreter = <T as Instruction>::Interpreter;
     }
     pub struct MoveRight<T>(T);
     impl<T: Instruction> Instruction for MoveRight<T>
@@ -484,21 +515,24 @@ mod instructions {
     {
         type Exec = <<T as Instruction>::Exec as indexed::IndexOp<operators::Add>>::Indexed;
         type Create<E> = MoveRight<<T as Instruction>::Create<E>>;
+        type Interpreter = <T as Instruction>::Interpreter;
     }
 
     pub struct MoveLeft<T>(T);
     impl<T: Instruction> Instruction for MoveLeft<T>
     where
-        <T as Instruction>::Exec: indexed::IndexOp<operators::Sub>
+        <T as Instruction>::Exec: indexed::IndexOp<operators::Sub>,
     {
-        type Create<E> = MoveLeft<E>;
         type Exec = <<T as Instruction>::Exec as indexed::IndexOp<operators::Sub>>::Indexed;
+        type Create<E> = MoveLeft<<T as Instruction>::Create<E>>;
+        type Interpreter = <T as Instruction>::Interpreter;
     }
 
     pub struct LoopStart<T>(T);
     impl<T: Instruction> Instruction for LoopStart<T> {
         type Exec = <T as Instruction>::Exec;
-        type Create<E> = LoopStart<<T as Instruction>::Create<T>>;
+        type Create<E> = LoopStart<E>;
+        type Interpreter = <T as Instruction>::Interpreter;
     }
     pub struct LoopEnd<T>(T);
 
@@ -506,7 +540,7 @@ mod instructions {
         type LoopOut;
     }
     impl<T: Instruction> Loop<Zero> for LoopEnd<T> {
-        type LoopOut = <T as Instruction>::Exec;
+        type LoopOut = <T as Instruction>::Interpreter;
     }
 
     impl<T: Instruction, Val> Loop<NextNumber<Val>> for LoopEnd<T> {
@@ -520,15 +554,17 @@ mod instructions {
     {
         type Exec = <<Self as Loop<GetCondition<Self>>>::LoopOut as Instruction>::Exec;
         type Create<E> = E;
+        type Interpreter = <T as Instruction>::Interpreter;
     }
+
     pub struct Print<T>(T);
     impl<T: Instruction> Instruction for Print<T>
-    where <T as Instruction>::Exec: brainfuck::Print
+    where
+        <T as Instruction>::Exec: brainfuck::Print,
     {
-        type Exec = <
-            <T as Instruction>::Exec as brainfuck::Print
-        >::Out;
+        type Exec = <<T as Instruction>::Exec as brainfuck::Print>::Out;
         type Create<E> = Print<E>;
+        type Interpreter = <T as Instruction>::Interpreter;
     }
     /*impl<T: LoopInstruction> LoopInstruction for LoopEnd<T> {
         type Exec = <T as LoopInstruction>::Exec;
@@ -543,20 +579,32 @@ mod instructions {
             })*
         };
     }
-    getter!(LoopStart, LoopEnd, Decr, MoveRight, MoveLeft, Incr);
+    getter!(LoopEnd, Decr, MoveRight, MoveLeft, Incr);
+    impl<T> Get for LoopStart<T>
+    where
+        Self: Instruction,
+        <Self as Instruction>::Exec: Get,
+    {
+        type Val = <<Self as Instruction>::Exec as Get>::Val;
+    }
 
-    type Execute<T> = <T as Instruction>::Exec;
+    pub type Execute<T> = <T as Instruction>::Exec;
     type GetRam<T> = <T as brainfuck::Debug>::Ram;
-    
 
     #[cfg(test)]
     mod tests {
         use std::any::type_name;
 
         use crate::{
-            brainfuck::{self, Interpreter}, indexed::{Debug, Indexed}, instructions::{
-                Decr, Execute, GetCondition, GetRam, Incr, Instruction, Loop, LoopEnd, LoopStart, MoveRight, MoveLeft, Print
-            }, linked_list::{End, Node}, numbers::{One, Three, Two, Zero}, TypeNamed
+            brainfuck::{self, InterpreterBase},
+            indexed::{self, Debug, Get, Indexed},
+            instructions::{
+                Decr, Execute, GetCondition, GetRam, Incr, Instruction, Loop, LoopEnd, LoopStart,
+                MoveLeft, MoveRight, Print,
+            },
+            linked_list::{End, Node},
+            numbers::{Nine, Number, One, Three, Two, Zero},
+            TypeNamed,
         };
 
         #[test]
@@ -565,7 +613,7 @@ mod instructions {
             type Ram = list![Three];
             assert_eq!(Ram::data(), [3]);
             assert_eq!(Ram::index(), 0);
-            type Ram2 = Interpreter<Ram, list![]>;
+            type Ram2 = InterpreterBase<Ram, list![]>;
             type Code = bf!(Ram2; [-]>+.);
             //type Code = bf!(Ram; [-]>+);
             // evaluate the code
@@ -574,65 +622,129 @@ mod instructions {
             assert_eq!(Output::index(), 1);
         }
         #[test]
-        fn test_loop2(){
-            type Ram = Interpreter<list![], list![]>;
-            type Code = bf!(Ram; ++[-]);
+        fn test_loop2() {
+            type Ram = InterpreterBase<list![], list![]>;
+            type Code = bf!(Ram; ++[-]+);
             type Output = GetRam<Execute<Code>>;
-            assert_eq!(Output::data(), [0]);
+            //assert_eq!(<Output as indexed::Get>::Val::eval(), 0);
+            assert_eq!(Output::data(), [1]);
+        }
+        #[test]
+        fn empty_loop() {
+            type Ram = InterpreterBase<list![Zero, One], list![]>;
+            type Code = bf!(Ram; [>-<]);
+            type Output = GetRam<Execute<Code>>;
+            assert_eq!(Output::data(), [0, 1]);
+        }
+        #[test]
+        fn base_loop_3() {
+            type Ram = InterpreterBase<list![Nine], list![]>;
+            type Code = bf!(Ram; [>+<-]);
+
+            type Iter1 = <Code as Loop<GetCondition<Code>>>::LoopOut;
+            assert_eq!(<Iter1 as brainfuck::Debug>::Ram::data(), [8, 1]);
+
+            type Iter2 = <Iter1 as Loop<GetCondition<Iter1>>>::LoopOut;
+            assert_eq!(<Iter2 as brainfuck::Debug>::Ram::data(), [7, 2]);
+
+            type Iter3 = <Iter2 as Loop<GetCondition<Iter2>>>::LoopOut;
+            assert_eq!(<Iter3 as brainfuck::Debug>::Ram::data(), [6, 3]);
+
+            type Iter4 = <Iter3 as Loop<GetCondition<Iter3>>>::LoopOut;
+            assert_eq!(<Iter4 as brainfuck::Debug>::Ram::data(), [5, 4]);
+
+            type Iter5 = <Iter4 as Loop<GetCondition<Iter4>>>::LoopOut;
+            assert_eq!(<Iter5 as brainfuck::Debug>::Ram::data(), [4, 5]);
+
+            type Iter6 = <Iter5 as Loop<GetCondition<Iter5>>>::LoopOut;
+            assert_eq!(<Iter6 as brainfuck::Debug>::Ram::data(), [3, 6]);
+
+            type Iter7 = <Iter6 as Loop<GetCondition<Iter6>>>::LoopOut;
+            assert_eq!(<Iter7 as brainfuck::Debug>::Ram::data(), [2, 7]);
+
+            type Iter8 = <Iter7 as Loop<GetCondition<Iter7>>>::LoopOut;
+            assert_eq!(<Iter8 as brainfuck::Debug>::Ram::data(), [1, 8]);
+
+            type Iter9 = <Iter8 as Loop<GetCondition<Iter8>>>::LoopOut;
+            assert_eq!(<Iter9 as brainfuck::Debug>::Ram::data(), [0, 9]);
+
+            type Iter10 = <Iter9 as Loop<GetCondition<Iter9>>>::LoopOut;
+            assert_eq!(<Iter10 as brainfuck::Debug>::Ram::data(), [0, 9]);
+            //assert_eq!(Output::data(), [0,2]);
+        }
+
+        #[test]
+        fn test_loop_3() {
+            type Ram = InterpreterBase<list![Nine], list![]>;
+            type Code = bf!(Ram; [>+<-]);
+            type Output = Execute<Code>;
+            //panic!("{}", Output::name());
+            assert_eq!(<Output as brainfuck::Debug>::Ram::data(), [0, 9]);
         }
     }
 }
 
 mod brainfuck {
-    use crate::indexed;
+    use crate::{indexed, instructions};
 
-    pub struct Interpreter<Ram, Output>(Ram, Output);
+    pub struct InterpreterBase<Ram, Output>(Ram, Output);
     pub trait Debug {
         type Output;
         type Ram;
     }
-    impl<Ram, Output> Debug for Interpreter<Ram, Output>{
+    impl<Ram, Output> Debug for InterpreterBase<Ram, Output> {
         type Output = Output;
         type Ram = Ram;
     }
-
-    impl<Op, Ram, Output> indexed::VecOp<Op> for Interpreter<Ram, Output>
-    where Ram: indexed::VecOp<Op>
-    {
-        type Indexed = Interpreter<<Ram as indexed::VecOp<Op>>::Indexed, Output>;
+    macro_rules! debug_wrapper {
+        ($($items:ident),*) => {
+                $(
+                    impl<T: Debug> Debug for instructions::$items<T>{
+                        type Output = <T as Debug>::Output;
+                        type Ram = <T as Debug>::Ram;
+                    }
+                )*
+        };
     }
-    impl<Op, Ram, Output> indexed::IndexOp<Op> for Interpreter<Ram, Output>
-    where Ram: indexed::IndexOp<Op>
+    debug_wrapper!(Incr, Decr, MoveRight, MoveLeft, LoopStart, LoopEnd);
+
+    impl<Op, Ram, Output> indexed::VecOp<Op> for InterpreterBase<Ram, Output>
+    where
+        Ram: indexed::VecOp<Op>,
     {
-        type Indexed = Interpreter<<Ram as indexed::IndexOp<Op>>::Indexed, Output>;
+        type Indexed = InterpreterBase<<Ram as indexed::VecOp<Op>>::Indexed, Output>;
+    }
+    impl<Op, Ram, Output> indexed::IndexOp<Op> for InterpreterBase<Ram, Output>
+    where
+        Ram: indexed::IndexOp<Op>,
+    {
+        type Indexed = InterpreterBase<<Ram as indexed::IndexOp<Op>>::Indexed, Output>;
     }
 
     pub trait Print {
         type Out;
     }
-    impl<Ram, Output> Print for Interpreter<Ram, Output>
-    where Ram: indexed::Get,
-        Output: indexed::Push< <Ram as indexed::Get>::Val >
-     {
-        type Out = Interpreter<
-            Ram,
-            < Output as indexed::Push<
-                <Ram as indexed::Get>::Val
-                >
-            >::Indexed
-        >;
+    impl<Ram, Output> Print for InterpreterBase<Ram, Output>
+    where
+        Ram: indexed::Get,
+        Output: indexed::Push<<Ram as indexed::Get>::Val>,
+    {
+        type Out = InterpreterBase<Ram, <Output as indexed::Push<<Ram as indexed::Get>::Val>>::Indexed>;
     }
+    pub type GetOutput<T> = <T as Debug>::Output;
+    pub type Interpreter = InterpreterBase<list!(), list!()>;
 }
 
+
+
 fn main() {
-    type Init = crate::brainfuck::Interpreter<list![], list![]>;
     use crate::instructions::*;
-    type Code = bf!(Init; ++++++++++[-]);
-  //type Code = bf!(Init; ++++++++++[>+++++++>++++++++++>+++>+<<<<-]);
-  //type Code = bf!(Init; ++++++++++[>+++++++>++++++++++>+++>+<<<<-]>++.>+.+++++++..+++.>++.<<+++++++++++++++.>.+++.------.--------.>+.>.);
-    type Output = <Code as Instruction>::Exec;
-    type String = <Output as crate::brainfuck::Debug>::Output;
-    type Ram = <Output as crate::brainfuck::Debug>::Ram;
-    println!("{}", Ram::name());
-    println!("{}", String::name());
+    type Base = crate::brainfuck::Interpreter;
+    type Code = bf!(Base; +++++++++[>++++++++>+++++++++++>++++>+++++++++>+++++++++++++<<<<<-]>.>++.+++++++..+++.>----.>+++.>++++.<<<+.-----------.>>>------.<<+.);
+    type Final = Execute<Code>;
+    type Output = GetOutput<Final>;
+
+    // unwrap since a program output may not be a valid string
+    let data = Output::string().unwrap();
+    assert_eq!(data, "Hello Types!");
 }
